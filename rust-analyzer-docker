@@ -1,0 +1,2 @@
+#!/bin/sh
+exec docker exec -i -e RUSTUP_TOOLCHAIN=esp esp32-dev rustup run stable rust-analyzer "$@"
