@@ -41,13 +41,13 @@ impl<'a, S: TimerSpeed> Servo360<'a, S> {
 
 impl<'a, S: TimerSpeed> Servo for Servo360<'a, S> {
     fn open<D: DelayNs>(&mut self, delay: &mut D) {
-        self.spin_cw();
+        self.spin_ccw();
         delay.delay_ms(self.puls_ms);
         self.stop();
     }
 
     fn close<D: DelayNs>(&mut self, delay: &mut D) {
-        self.spin_ccw();
+        self.spin_cw();
         delay.delay_ms(self.puls_ms);
         self.stop();
     }

@@ -49,7 +49,7 @@ where
     }
 
     pub fn read_percentage(&mut self) -> u8 {
-        let raw = self.read_raw();
+        let raw = self.read_raw_filtered();
 
         if raw >= self.dry_value {
             return 0;
