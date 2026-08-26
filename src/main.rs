@@ -49,12 +49,14 @@ esp_bootloader_esp_idf::esp_app_desc!();
 async fn main(_spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
     println!("Planty starting...");
+    println!("WIFI_SSID: {}", WIFI_SSID);
+    println!("WIFI_PASSWORD: {}", WIFI_PASSWORD);
 
     // --- Peripherals ---
     let mut adc1_config = AdcConfig::new();
@@ -136,8 +138,8 @@ async fn main(_spawner: Spawner) {
         .spawn(planty::wifi::net_task(runner))
         .expect("Failed to spawn net task");
 
-    stack.wait_link_up().await;
-    println!("6. Network link up");
+    stack.wait_config_up().await;
+    println!("6. Network ready (DHCP OK)");
 
     // --- MQTT ---
     println!("7. Connecting MQTT...");
