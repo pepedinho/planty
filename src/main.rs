@@ -6,6 +6,7 @@ extern crate alloc;
 use core::net::Ipv4Addr;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_time::Timer;
 use esp_backtrace as _;
@@ -39,6 +40,9 @@ const TOPIC_MOTOR: &str = "planty/mecha/motor";
 const TOPIC_CALIBRATE: &str = "planty/sensor/calibrate";
 const TOPIC_SOIL: &str = "planty/sensor/soil";
 
+const POLL_TIMEOUT_MS: u64 = 200;
+const RECONNECT_DELAY_MS: u64 = 5000;
+
 static mut STACK_RESOURCES: embassy_net::StackResources<5> = embassy_net::StackResources::new();
 static mut TCP_RX_BUF: [u8; 1024] = [0u8; 1024];
 static mut TCP_TX_BUF: [u8; 1024] = [0u8; 1024];
@@ -55,8 +59,6 @@ async fn main(_spawner: Spawner) {
     esp_rtos::start(timg0.timer0);
 
     println!("Planty starting...");
-    println!("WIFI_SSID: {}", WIFI_SSID);
-    println!("WIFI_PASSWORD: {}", WIFI_PASSWORD);
 
     // --- Peripherals ---
     let mut adc1_config = AdcConfig::new();
@@ -77,9 +79,8 @@ async fn main(_spawner: Spawner) {
     let mut ledc = Ledc::new(peripherals.LEDC);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
-    let mut timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
-    timer
-        .configure(timer::config::Config {
+    let mut t = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    t.configure(timer::config::Config {
             duty: Duty::Duty14Bit,
             clock_source: timer::LSClockSource::APBClk,
             frequency: Rate::from_hz(50),
@@ -89,7 +90,7 @@ async fn main(_spawner: Spawner) {
     let mut channel = ledc.channel(channel::Number::Channel0, peripherals.GPIO18);
     channel
         .configure(channel::config::Config {
-            timer: &timer,
+            timer: &t,
             duty_pct: 0,
             drive_mode: DriveMode::PushPull,
         })
@@ -103,7 +104,6 @@ async fn main(_spawner: Spawner) {
     // --- WiFi ---
     println!("4. Initializing WiFi...");
     let radio_controller = esp_radio::init().expect("Failed to init radio");
-    // Leak to get 'static lifetime - this is intentional, radio lives for program lifetime
     let radio_static: &'static esp_radio::Controller<'static> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(radio_controller));
     let (mut wifi, sta_device) = planty::wifi::connect(
@@ -130,7 +130,6 @@ async fn main(_spawner: Spawner) {
         random_seed,
     );
 
-    // SAFETY: runner is 'static because it references our static STACK_RESOURCES.
     let runner: embassy_net::Runner<'static, esp_radio::wifi::WifiDevice<'static>> =
         unsafe { core::mem::transmute(runner) };
 
@@ -141,39 +140,25 @@ async fn main(_spawner: Spawner) {
     stack.wait_config_up().await;
     println!("6. Network ready (DHCP OK)");
 
-    // --- MQTT ---
+    // --- MQTT connect with retry ---
+    let mut socket = new_socket(stack);
+
     println!("7. Connecting MQTT...");
-    let mut socket = TcpSocket::new(
-        stack,
-        unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX_BUF) },
-        unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX_BUF) },
-    );
 
-    socket
-        .connect((
-            Ipv4Addr::new(
-                MQTT_BROKER_IP[0],
-                MQTT_BROKER_IP[1],
-                MQTT_BROKER_IP[2],
-                MQTT_BROKER_IP[3],
-            ),
-            MQTT_BROKER_PORT,
-        ))
-        .await
-        .expect("Failed to connect TCP to broker");
+    let mut mqtt_connected;
+    loop {
+        mqtt_connected = try_mqtt_connect(&mut socket).await;
+        if mqtt_connected {
+            break;
+        }
+        let raw = sensor.read_raw();
+        let humidity = sensor.read_percentage();
+        oled.show_metrics(raw, humidity, true, false);
+        println!("MQTT failed, retrying in {}s...", RECONNECT_DELAY_MS / 1000);
+        Timer::after_millis(RECONNECT_DELAY_MS).await;
+    }
 
-    mqtt::connect(&mut socket, MQTT_CLIENT_ID, 60)
-        .await
-        .expect("Failed to MQTT connect");
-    println!("8. MQTT connected");
-
-    mqtt::subscribe(&mut socket, TOPIC_MOTOR, 1)
-        .await
-        .expect("Failed to subscribe motor topic");
-    mqtt::subscribe(&mut socket, TOPIC_CALIBRATE, 2)
-        .await
-        .expect("Failed to subscribe calibrate topic");
-    println!("9. MQTT subscribed");
+    println!("8. MQTT ready");
 
     let mut publish_counter: u32 = 0;
 
@@ -203,60 +188,135 @@ async fn main(_spawner: Spawner) {
             last_state = current_state;
         }
 
-        // 3. Poll MQTT for commands
-        if let Some(event) = mqtt::poll(&mut socket, &mut cal_buf).await {
-            match event {
-                mqtt::MqttEvent::Publish { topic, payload } => {
-                    if topic == TOPIC_MOTOR {
-                        match core::str::from_utf8(payload) {
-                            Ok("open") => {
-                                println!("MQTT: Opening valve...");
-                                valve.open(&mut delay);
-                                delay.delay_millis(1500);
-                            }
-                            Ok("close") => {
-                                println!("MQTT: Closing valve...");
-                                valve.close(&mut delay);
-                                delay.delay_millis(1500);
-                            }
-                            Ok(other) => println!("MQTT: unknown motor cmd: {}", other),
-                            Err(_) => println!("MQTT: motor cmd not valid utf8"),
-                        }
-                    } else if topic == TOPIC_CALIBRATE {
-                        match core::str::from_utf8(payload) {
-                            Ok(json) => {
-                                if let Some((dry, wet)) = parse_calibration(json) {
-                                    println!("MQTT: Calibrating dry={} wet={}", dry, wet);
-                                    sensor.calibrate(dry, wet);
-                                } else {
-                                    println!("MQTT: failed to parse calibration json");
+        // 3. Poll MQTT for commands (with timeout — non-blocking)
+        let poll_fut = mqtt::poll(&mut socket, &mut cal_buf);
+        let timeout_fut = Timer::after_millis(POLL_TIMEOUT_MS);
+
+        match select(poll_fut, timeout_fut).await {
+            Either::First(Some(event)) => {
+                match event {
+                    mqtt::MqttEvent::Publish { topic, payload } => {
+                        if topic == TOPIC_MOTOR {
+                            match core::str::from_utf8(payload) {
+                                Ok("open") => {
+                                    println!("MQTT: Opening valve...");
+                                    valve.open(&mut delay);
+                                    delay.delay_millis(1500);
                                 }
+                                Ok("close") => {
+                                    println!("MQTT: Closing valve...");
+                                    valve.close(&mut delay);
+                                    delay.delay_millis(1500);
+                                }
+                                Ok(other) => println!("MQTT: unknown motor cmd: {}", other),
+                                Err(_) => println!("MQTT: motor cmd not valid utf8"),
                             }
-                            Err(_) => println!("MQTT: calibrate not valid utf8"),
+                        } else if topic == TOPIC_CALIBRATE {
+                            match core::str::from_utf8(payload) {
+                                Ok(json) => {
+                                    if let Some((dry, wet)) = parse_calibration(json) {
+                                        println!("MQTT: Calibrating dry={} wet={}", dry, wet);
+                                        sensor.calibrate(dry, wet);
+                                    } else {
+                                        println!("MQTT: failed to parse calibration json");
+                                    }
+                                }
+                                Err(_) => println!("MQTT: calibrate not valid utf8"),
+                            }
                         }
                     }
+                    mqtt::MqttEvent::PingResp => {}
+                    mqtt::MqttEvent::SubAck => {}
+                    mqtt::MqttEvent::ConnAck => {}
                 }
-                mqtt::MqttEvent::PingResp => {}
-                mqtt::MqttEvent::SubAck => {}
-                mqtt::MqttEvent::ConnAck => {}
+            }
+            Either::First(None) => {
+                // poll returned None — socket read error, connection lost
+                println!("MQTT: connection lost");
+                mqtt_connected = reconnect_loop(&mut socket, stack).await;
+            }
+            Either::Second(_) => {
+                // Timeout — no MQTT data, that's fine
             }
         }
 
         // 4. Publish sensor data periodically
-        publish_counter += 1;
         if publish_counter >= 5 {
             publish_counter = 0;
             let mut payload = [0u8; 8];
             let len = format_number(humidity, &mut payload);
-            let _ = mqtt::publish(&mut socket, TOPIC_SOIL, &payload[..len]).await;
+            if mqtt::publish(&mut socket, TOPIC_SOIL, &payload[..len])
+                .await
+                .is_err()
+            {
+                println!("MQTT: publish failed, reconnecting...");
+                mqtt_connected = reconnect_loop(&mut socket, stack).await;
+            }
         }
+        publish_counter += 1;
 
         // 5. Update display
-        oled.show_metrics(raw, humidity);
+        oled.show_metrics(raw, humidity, true, mqtt_connected);
         println!("Raw: {} | Humidity: {}%", raw, humidity);
 
         // 6. Wait
         Timer::after_millis(1000).await;
+    }
+}
+
+fn new_socket<'a>(stack: embassy_net::Stack<'a>) -> TcpSocket<'a> {
+    TcpSocket::new(
+        stack,
+        unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX_BUF) },
+        unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX_BUF) },
+    )
+}
+
+async fn try_mqtt_connect(socket: &mut TcpSocket<'_>) -> bool {
+    socket.close();
+
+    let tcp_result = socket
+        .connect((
+            Ipv4Addr::new(
+                MQTT_BROKER_IP[0],
+                MQTT_BROKER_IP[1],
+                MQTT_BROKER_IP[2],
+                MQTT_BROKER_IP[3],
+            ),
+            MQTT_BROKER_PORT,
+        ))
+        .await;
+
+    match tcp_result {
+        Ok(()) => {
+            if mqtt::connect(socket, MQTT_CLIENT_ID, 60).await.is_ok() {
+                let _ = mqtt::subscribe(socket, TOPIC_MOTOR, 1).await;
+                let _ = mqtt::subscribe(socket, TOPIC_CALIBRATE, 2).await;
+                println!("MQTT connected + subscribed");
+                return true;
+            }
+            println!("MQTT protocol handshake failed");
+        }
+        Err(e) => {
+            println!("TCP connect failed: {:?}", e);
+        }
+    }
+    false
+}
+
+async fn reconnect_loop<'a>(socket: &mut TcpSocket<'a>, stack: embassy_net::Stack<'a>) -> bool {
+    println!("Attempting MQTT reconnect...");
+
+    loop {
+        // Recreate socket (old one may be in bad state)
+        *socket = new_socket(stack);
+
+        if try_mqtt_connect(socket).await {
+            return true;
+        }
+
+        println!("Reconnect failed, retrying in {}s...", RECONNECT_DELAY_MS / 1000);
+        Timer::after_millis(RECONNECT_DELAY_MS).await;
     }
 }
 
