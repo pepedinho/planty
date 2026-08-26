@@ -1,11 +1,17 @@
 use embedded_io_async::Write;
+use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
+use embassy_time::Timer;
+
+const WRITE_TIMEOUT_MS: u64 = 1000;
+const READ_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug)]
 pub enum MqttError {
     ConnectionFailed,
     ProtocolError,
     IoError,
+    Timeout,
 }
 
 #[derive(Debug, Clone)]
@@ -97,16 +103,32 @@ pub async fn connect(
     buf[idx..idx + client_id_bytes.len()].copy_from_slice(client_id_bytes);
     idx += client_id_bytes.len();
 
-    socket
-        .write_all(&buf[..idx])
-        .await
-        .map_err(|_| MqttError::IoError)?;
+    match select(
+        socket.write_all(&buf[..idx]),
+        Timer::after_millis(WRITE_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => {}
+        Either::First(Err(_)) => return Err(MqttError::IoError),
+        Either::Second(_) => return Err(MqttError::Timeout),
+    }
 
     // Wait for CONNACK
     let mut resp = [0u8; 4];
-    let n = socket.read(&mut resp).await.map_err(|_| MqttError::IoError)?;
-    if n < 4 || resp[0] != 0x20 || resp[3] != 0x00 {
-        return Err(MqttError::ConnectionFailed);
+    match select(
+        socket.read(&mut resp),
+        Timer::after_millis(READ_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(n)) => {
+            if n < 4 || resp[0] != 0x20 || resp[3] != 0x00 {
+                return Err(MqttError::ConnectionFailed);
+            }
+        }
+        Either::First(Err(_)) => return Err(MqttError::IoError),
+        Either::Second(_) => return Err(MqttError::Timeout),
     }
 
     Ok(())
@@ -140,19 +162,32 @@ pub async fn subscribe(
     buf[idx] = 0x00; // QoS 0
     idx += 1;
 
-    socket
-        .write_all(&buf[..idx])
-        .await
-        .map_err(|_| MqttError::IoError)?;
+    match select(
+        socket.write_all(&buf[..idx]),
+        Timer::after_millis(WRITE_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => {}
+        Either::First(Err(_)) => return Err(MqttError::IoError),
+        Either::Second(_) => return Err(MqttError::Timeout),
+    }
 
     // Wait for SUBACK
     let mut resp = [0u8; 5];
-    let n = socket
-        .read(&mut resp)
-        .await
-        .map_err(|_| MqttError::IoError)?;
-    if n < 4 || resp[0] != 0x90 {
-        return Err(MqttError::ProtocolError);
+    match select(
+        socket.read(&mut resp),
+        Timer::after_millis(READ_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(n)) => {
+            if n < 4 || resp[0] != 0x90 {
+                return Err(MqttError::ProtocolError);
+            }
+        }
+        Either::First(Err(_)) => return Err(MqttError::IoError),
+        Either::Second(_) => return Err(MqttError::Timeout),
     }
 
     Ok(())
@@ -186,20 +221,31 @@ pub async fn publish(
     buf[idx..payload_end].copy_from_slice(payload);
     idx = payload_end;
 
-    socket
-        .write_all(&buf[..idx])
-        .await
-        .map_err(|_| MqttError::IoError)?;
+    match select(
+        socket.write_all(&buf[..idx]),
+        Timer::after_millis(WRITE_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => {}
+        Either::First(Err(_)) => return Err(MqttError::IoError),
+        Either::Second(_) => return Err(MqttError::Timeout),
+    }
 
     Ok(())
 }
 
 pub async fn ping(socket: &mut TcpSocket<'_>) -> Result<(), MqttError> {
-    socket
-        .write_all(&[0xC0, 0x00])
-        .await
-        .map_err(|_| MqttError::IoError)?;
-    Ok(())
+    match select(
+        socket.write_all(&[0xC0, 0x00]),
+        Timer::after_millis(WRITE_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => Ok(()),
+        Either::First(Err(_)) => Err(MqttError::IoError),
+        Either::Second(_) => Err(MqttError::Timeout),
+    }
 }
 
 pub async fn poll<'a>(

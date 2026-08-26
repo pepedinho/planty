@@ -42,6 +42,7 @@ const TOPIC_SOIL: &str = "planty/sensor/soil";
 
 const POLL_TIMEOUT_MS: u64 = 200;
 const RECONNECT_DELAY_MS: u64 = 5000;
+const TCP_CONNECT_TIMEOUT_MS: u64 = 5000;
 
 static mut STACK_RESOURCES: embassy_net::StackResources<5> = embassy_net::StackResources::new();
 static mut TCP_RX_BUF: [u8; 1024] = [0u8; 1024];
@@ -275,17 +276,28 @@ fn new_socket<'a>(stack: embassy_net::Stack<'a>) -> TcpSocket<'a> {
 async fn try_mqtt_connect(socket: &mut TcpSocket<'_>) -> bool {
     socket.close();
 
-    let tcp_result = socket
-        .connect((
-            Ipv4Addr::new(
-                MQTT_BROKER_IP[0],
-                MQTT_BROKER_IP[1],
-                MQTT_BROKER_IP[2],
-                MQTT_BROKER_IP[3],
-            ),
-            MQTT_BROKER_PORT,
-        ))
-        .await;
+    let addr = (
+        Ipv4Addr::new(
+            MQTT_BROKER_IP[0],
+            MQTT_BROKER_IP[1],
+            MQTT_BROKER_IP[2],
+            MQTT_BROKER_IP[3],
+        ),
+        MQTT_BROKER_PORT,
+    );
+
+    let tcp_result = match select(
+        socket.connect(addr),
+        Timer::after_millis(TCP_CONNECT_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(result) => result,
+        Either::Second(_) => {
+            println!("TCP connect timed out");
+            return false;
+        }
+    };
 
     match tcp_result {
         Ok(()) => {
