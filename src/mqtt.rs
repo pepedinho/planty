@@ -217,11 +217,16 @@ pub async fn poll<'a>(
     match packet_type {
         0x03 => {
             // PUBLISH
-            if data.len() < 3 {
+            if data.len() < 4 {
                 return None;
             }
-            let (topic_len, topic_len_bytes) = decode_variable_length(&data[1..]).ok()?;
-            let topic_start = 1 + topic_len_bytes;
+            let (_remaining_len, var_len_bytes) = decode_variable_length(&data[1..]).ok()?;
+            let var_start = 1 + var_len_bytes;
+            if data.len() < var_start + 2 {
+                return None;
+            }
+            let topic_len = ((data[var_start] as usize) << 8) | (data[var_start + 1] as usize);
+            let topic_start = var_start + 2;
             let topic_end = topic_start + topic_len;
             if topic_end > data.len() {
                 return None;
