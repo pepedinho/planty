@@ -65,7 +65,7 @@ async fn main(_spawner: Spawner) {
     let pin_g34 = adc1_config.enable_pin(peripherals.GPIO34, Attenuation::_11dB);
     let adc1 = Adc::new(peripherals.ADC1, adc1_config);
     let mut sensor = SoilSensor::new(adc1, pin_g34);
-    sensor.calibrate(715, 430);
+    sensor.calibrate(3263, 1610);
     println!("1. Soil Sensor OK (GPIO34 / ADC1)");
 
     let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
