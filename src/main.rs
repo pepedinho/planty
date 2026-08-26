@@ -75,6 +75,7 @@ async fn main(_spawner: Spawner) {
         .with_scl(peripherals.GPIO22);
     println!("2. I2C OK");
     let mut oled = OledScreen::new(i2c).expect("Failing to init OLED");
+    oled.show_boot("Init...", "OLED OK");
     println!("3. OLED screen OK");
 
     let mut ledc = Ledc::new(peripherals.LEDC);
@@ -104,6 +105,7 @@ async fn main(_spawner: Spawner) {
 
     // --- WiFi ---
     println!("4. Initializing WiFi...");
+    oled.show_boot("WiFi...", "Connecting");
     let radio_controller = esp_radio::init().expect("Failed to init radio");
     let radio_static: &'static esp_radio::Controller<'static> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(radio_controller));
@@ -122,6 +124,7 @@ async fn main(_spawner: Spawner) {
         .await
         .expect("Failed to connect WiFi");
     println!("5. WiFi connected");
+    oled.show_boot("WiFi", "Connected");
 
     // --- Embassy-net ---
     let random_seed = esp_hal::rng::Rng::new().random() as u64;
@@ -140,11 +143,13 @@ async fn main(_spawner: Spawner) {
 
     stack.wait_config_up().await;
     println!("6. Network ready (DHCP OK)");
+    oled.show_boot("Network", "DHCP OK");
 
     // --- MQTT connect with retry ---
     let mut socket = new_socket(stack);
 
     println!("7. Connecting MQTT...");
+    oled.show_boot("MQTT...", "Connecting");
 
     let mut mqtt_connected;
     loop {
@@ -160,6 +165,7 @@ async fn main(_spawner: Spawner) {
     }
 
     println!("8. MQTT ready");
+    oled.show_boot("MQTT", "Connected");
 
     let mut publish_counter: u32 = 0;
 
