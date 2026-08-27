@@ -40,7 +40,43 @@ where
         let _ = self.display.flush();
     }
 
-    pub fn show_metrics(&mut self, raw: u16, percentage: u8) {
+    pub fn show_boot(&mut self, step: &str, detail: &str) {
+        self.display.clear_buffer();
+
+        let style = MonoTextStyleBuilder::new()
+            .font(&FONT_8X13)
+            .text_color(BinaryColor::On)
+            .build();
+
+        let mut buf_title = [b' '; 16];
+        let mut buf_detail = [b' '; 16];
+
+        let mut w1 = BufferWriter::new(&mut buf_title);
+        let _ = write!(w1, "PLANTY");
+
+        let mut w2 = BufferWriter::new(&mut buf_detail);
+        let _ = write!(w2, "{}", step);
+
+        let mut buf3 = [b' '; 16];
+        let mut w3 = BufferWriter::new(&mut buf3);
+        let _ = write!(w3, "{}", detail);
+
+        Text::with_baseline(w1.as_str(), Point::new(0, 1), style, Baseline::Top)
+            .draw(&mut self.display)
+            .ok();
+
+        Text::with_baseline(w2.as_str(), Point::new(0, 24), style, Baseline::Top)
+            .draw(&mut self.display)
+            .ok();
+
+        Text::with_baseline(w3.as_str(), Point::new(0, 48), style, Baseline::Top)
+            .draw(&mut self.display)
+            .ok();
+
+        let _ = self.display.flush();
+    }
+
+    pub fn show_metrics(&mut self, raw: u16, percentage: u8, wifi_ok: bool, mqtt_ok: bool) {
         self.display.clear_buffer();
 
         let style = MonoTextStyleBuilder::new()
@@ -50,6 +86,7 @@ where
 
         let mut buf1 = [b' '; 16];
         let mut buf2 = [b' '; 16];
+        let mut buf3 = [b' '; 16];
 
         let state = if percentage < 30 { "DRY!" } else { "OK  " };
 
@@ -59,11 +96,20 @@ where
         let mut writer2 = BufferWriter::new(&mut buf2);
         let _ = write!(writer2, "Hum: {:>3}% [{}]", percentage, state);
 
+        let mut writer3 = BufferWriter::new(&mut buf3);
+        let w = if wifi_ok { "OK" } else { "! " };
+        let m = if mqtt_ok { "OK" } else { "! " };
+        let _ = write!(writer3, "W:{}  M:{}", w, m);
+
         Text::with_baseline(writer1.as_str(), Point::new(0, 1), style, Baseline::Top)
             .draw(&mut self.display)
             .ok();
 
         Text::with_baseline(writer2.as_str(), Point::new(0, 24), style, Baseline::Top)
+            .draw(&mut self.display)
+            .ok();
+
+        Text::with_baseline(writer3.as_str(), Point::new(0, 48), style, Baseline::Top)
             .draw(&mut self.display)
             .ok();
 

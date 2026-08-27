@@ -1,43 +1,91 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
 
+use core::net::Ipv4Addr;
+
+use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
+use embassy_net::tcp::TcpSocket;
+use embassy_time::Timer;
 use esp_backtrace as _;
-use esp_hal::{analog::adc::{Adc, AdcConfig, Attenuation, Resolution}, gpio::DriveMode, i2c::master::{Config, I2c}, ledc::{LSGlobalClkSource, Ledc, LowSpeed, channel::{self, ChannelIFace}, timer::{self, TimerIFace, config::Duty}}, main, time::Rate};
+use esp_hal::{
+    analog::adc::{Adc, AdcConfig, Attenuation},
+    gpio::DriveMode,
+    i2c::master::{Config as I2cConfig, I2c},
+    ledc::{
+        LSGlobalClkSource, Ledc, LowSpeed,
+        channel::{self, ChannelIFace},
+        timer::{self, TimerIFace, config::Duty},
+    },
+    time::Rate,
+    timer::timg::TimerGroup,
+};
 use esp_println::println;
-use planty::{display::OledScreen, servo::{Servo, Servo360}, soil::{SoilSensor, State}};
+use planty::{
+    display::OledScreen,
+    mqtt,
+    servo::{Servo, Servo360},
+    soil::{SoilSensor, State},
+};
+
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+const MQTT_BROKER_IP: [u8; 4] = [192, 168, 1, 32];
+const MQTT_BROKER_PORT: u16 = 1883;
+const MQTT_CLIENT_ID: &str = "planty-esp32";
+
+const TOPIC_MOTOR: &str = "planty/mecha/motor";
+const TOPIC_CALIBRATE: &str = "planty/sensor/calibrate";
+const TOPIC_SOIL: &str = "planty/sensor/soil";
+
+const POLL_TIMEOUT_MS: u64 = 200;
+const RECONNECT_DELAY_MS: u64 = 5000;
+const TCP_CONNECT_TIMEOUT_MS: u64 = 5000;
+
+static mut STACK_RESOURCES: embassy_net::StackResources<5> = embassy_net::StackResources::new();
+static mut TCP_RX_BUF: [u8; 1024] = [0u8; 1024];
+static mut TCP_TX_BUF: [u8; 1024] = [0u8; 1024];
+static mut MQTT_RX_BUF: [u8; 512] = [0u8; 512];
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[main]
-fn main() -> ! {
-    let config = esp_hal::Config::default();
-    let peripherals = esp_hal::init(config);
-    let mut delay = esp_hal::delay::Delay::new();
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) {
+    let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    println!("🌱 Planty ready !");
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
-    let mut adc2_config = AdcConfig::new();
-    let pin_g2 = adc2_config.enable_pin(peripherals.GPIO2, Attenuation::_11dB);
-    let adc2 = Adc::new(peripherals.ADC2, adc2_config);
-    let mut sensor = SoilSensor::new(adc2, pin_g2);
-    sensor.calibrate(715, 430);
-    println!("1. Soil Sensor OK");
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0);
 
-    let i2c = I2c::new(peripherals.I2C0, Config::default())
+    println!("Planty starting...");
+    println!("W_SSID {}", WIFI_SSID);
+    println!("W_PWS: {}", WIFI_PASSWORD);
+
+    // --- Peripherals ---
+    let mut adc1_config = AdcConfig::new();
+    let pin_g34 = adc1_config.enable_pin(peripherals.GPIO34, Attenuation::_11dB);
+    let adc1 = Adc::new(peripherals.ADC1, adc1_config);
+    let mut sensor = SoilSensor::new(adc1, pin_g34);
+    sensor.calibrate(3263, 1610);
+    println!("1. Soil Sensor OK (GPIO34 / ADC1)");
+
+    let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
         .unwrap()
         .with_sda(peripherals.GPIO21)
         .with_scl(peripherals.GPIO22);
     println!("2. I2C OK");
     let mut oled = OledScreen::new(i2c).expect("Failing to init OLED");
+    oled.show_boot("Init...", "OLED OK");
     println!("3. OLED screen OK");
 
     let mut ledc = Ledc::new(peripherals.LEDC);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
-    let mut timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
-    timer
-        .configure(timer::config::Config {
+    let mut t = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    t.configure(timer::config::Config {
             duty: Duty::Duty14Bit,
             clock_source: timer::LSClockSource::APBClk,
             frequency: Rate::from_hz(50),
@@ -47,39 +95,349 @@ fn main() -> ! {
     let mut channel = ledc.channel(channel::Number::Channel0, peripherals.GPIO18);
     channel
         .configure(channel::config::Config {
-            timer: &timer,
+            timer: &t,
             duty_pct: 0,
             drive_mode: DriveMode::PushPull,
         })
         .unwrap();
 
     let mut valve = Servo360::new(channel, 250);
-
     let mut last_state = State::Wet;
+    let mut delay = esp_hal::delay::Delay::new();
+    let mut mqtt_rx = mqtt::MqttRx::new(unsafe {
+        &mut *core::ptr::addr_of_mut!(MQTT_RX_BUF)
+    });
 
+    // --- WiFi ---
+    println!("4. Initializing WiFi...");
+    oled.show_boot("WiFi...", "Connecting");
+    let radio_controller = esp_radio::init().expect("Failed to init radio");
+    let radio_static: &'static esp_radio::Controller<'static> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(radio_controller));
+    let (mut wifi, sta_device) = planty::wifi::connect(
+        radio_static,
+        peripherals.WIFI,
+        WIFI_SSID,
+        WIFI_PASSWORD,
+    )
+    .expect("Failed to create WiFi");
+
+    wifi.start_async()
+        .await
+        .expect("Failed to start WiFi");
+    wifi.connect_async()
+        .await
+        .expect("Failed to connect WiFi");
+    println!("5. WiFi connected");
+    oled.show_boot("WiFi", "Connected");
+
+    // --- Embassy-net ---
+    let random_seed = esp_hal::rng::Rng::new().random() as u64;
+    let (stack, runner) = planty::wifi::setup_stack(
+        sta_device,
+        unsafe { &mut *core::ptr::addr_of_mut!(STACK_RESOURCES) },
+        random_seed,
+    );
+
+    let runner: embassy_net::Runner<'static, esp_radio::wifi::WifiDevice<'static>> =
+        unsafe { core::mem::transmute(runner) };
+
+    _spawner
+        .spawn(planty::wifi::net_task(runner))
+        .expect("Failed to spawn net task");
+
+    stack.wait_config_up().await;
+    println!("6. Network ready (DHCP OK)");
+    oled.show_boot("Network", "DHCP OK");
+
+    // --- MQTT connect with retry ---
+    let mut socket = new_socket(stack);
+
+    println!("7. Connecting MQTT...");
+    oled.show_boot("MQTT...", "Connecting");
+
+    let mut mqtt_connected;
     loop {
+        mqtt_connected = try_mqtt_connect(&mut socket).await;
+        if mqtt_connected {
+            break;
+        }
+        let raw = sensor.read_raw();
+        let humidity = sensor.read_percentage();
+        oled.show_metrics(raw, humidity, true, false);
+        println!("MQTT failed, retrying in {}s...", RECONNECT_DELAY_MS / 1000);
+        Timer::after_millis(RECONNECT_DELAY_MS).await;
+    }
+
+    println!("8. MQTT ready");
+    oled.show_boot("MQTT", "Connected");
+
+    let mut publish_counter: u32 = 0;
+
+    // --- Main loop ---
+    loop {
+        // 1. Read sensor
         let raw = sensor.read_raw();
         let humidity = sensor.read_percentage();
         let current_state = sensor.check_state();
 
+        // 2. Auto-control valve based on sensor
         if current_state != last_state {
             match current_state {
                 State::Dry => {
                     println!("DRY: Opening Valve...");
                     valve.open(&mut delay);
                     delay.delay_millis(1500);
+                    let _ = mqtt::publish(&mut socket, TOPIC_MOTOR, b"open").await;
                 }
                 State::Wet => {
                     println!("Wet: Closing Valve...");
                     valve.close(&mut delay);
                     delay.delay_millis(1500);
+                    let _ = mqtt::publish(&mut socket, TOPIC_MOTOR, b"close").await;
                 }
             }
             last_state = current_state;
         }
 
-        println!("Raw level: {} | Humidity: {}%", raw, humidity);
-        oled.show_metrics(raw, humidity);
-        delay.delay_millis(1000);
+        // 3. Poll MQTT for commands (with timeout — non-blocking)
+        let poll_fut = mqtt::poll(&mut socket, &mut mqtt_rx);
+        let timeout_fut = Timer::after_millis(POLL_TIMEOUT_MS);
+
+        match select(poll_fut, timeout_fut).await {
+            Either::First(mqtt::MqttStatus::Event(event)) => {
+                match event {
+                    mqtt::MqttEvent::Publish { topic, payload } => {
+                        let topic_str = topic.as_str();
+                        if topic_str == Some(TOPIC_MOTOR) {
+                            match payload.as_str() {
+                                Some("open") => {
+                                    println!("MQTT: Opening valve...");
+                                    valve.open(&mut delay);
+                                    delay.delay_millis(1500);
+                                }
+                                Some("close") => {
+                                    println!("MQTT: Closing valve...");
+                                    valve.close(&mut delay);
+                                    delay.delay_millis(1500);
+                                }
+                                Some(other) => println!("MQTT: unknown motor cmd: {}", other),
+                                None => println!("MQTT: motor cmd not valid utf8"),
+                            }
+                        } else if topic_str == Some(TOPIC_CALIBRATE) {
+                            match payload.as_str() {
+                                Some(json) => {
+                                    if let Some((dry, wet)) = parse_calibration(json) {
+                                        println!("MQTT: Calibrating dry={} wet={}", dry, wet);
+                                        sensor.calibrate(dry, wet);
+                                    } else {
+                                        println!("MQTT: failed to parse calibration json");
+                                    }
+                                }
+                                None => println!("MQTT: calibrate not valid utf8"),
+                            }
+                        }
+                    }
+                    mqtt::MqttEvent::PingResp => {}
+                    mqtt::MqttEvent::SubAck => {}
+                    mqtt::MqttEvent::ConnAck => {}
+                }
+            }
+            Either::First(mqtt::MqttStatus::Disconnected) => {
+                // Socket read error — connection lost
+                println!("MQTT: connection lost");
+                mqtt_connected = reconnect_loop(&mut wifi, &mut socket, stack, &mut oled).await;
+            }
+            Either::First(mqtt::MqttStatus::NoData) => {
+                // No complete packet available, nothing to do
+            }
+            Either::Second(_) => {
+                // Timeout — no MQTT data, that's fine
+            }
+        }
+
+        // 4. Publish sensor data periodically
+        if publish_counter >= 5 {
+            publish_counter = 0;
+            let mut payload = [0u8; 8];
+            let len = format_number(humidity, &mut payload);
+            if mqtt::publish(&mut socket, TOPIC_SOIL, &payload[..len])
+                .await
+                .is_err()
+            {
+                println!("MQTT: publish failed, reconnecting...");
+                mqtt_connected = reconnect_loop(&mut wifi, &mut socket, stack, &mut oled).await;
+            }
+        }
+        publish_counter += 1;
+
+        // 5. Update display
+        oled.show_metrics(raw, humidity, true, mqtt_connected);
+        println!("Raw: {} | Humidity: {}%", raw, humidity);
+
+        // 6. Wait
+        Timer::after_millis(1000).await;
     }
+}
+
+fn new_socket<'a>(stack: embassy_net::Stack<'a>) -> TcpSocket<'a> {
+    TcpSocket::new(
+        stack,
+        unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX_BUF) },
+        unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX_BUF) },
+    )
+}
+
+async fn try_mqtt_connect(socket: &mut TcpSocket<'_>) -> bool {
+    socket.close();
+
+    let addr = (
+        Ipv4Addr::new(
+            MQTT_BROKER_IP[0],
+            MQTT_BROKER_IP[1],
+            MQTT_BROKER_IP[2],
+            MQTT_BROKER_IP[3],
+        ),
+        MQTT_BROKER_PORT,
+    );
+
+    let tcp_result = match select(
+        socket.connect(addr),
+        Timer::after_millis(TCP_CONNECT_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(result) => result,
+        Either::Second(_) => {
+            println!("TCP connect timed out");
+            return false;
+        }
+    };
+
+    match tcp_result {
+        Ok(()) => {
+            if mqtt::connect(socket, MQTT_CLIENT_ID, 60).await.is_ok() {
+                let _ = mqtt::subscribe(socket, TOPIC_MOTOR, 1).await;
+                let _ = mqtt::subscribe(socket, TOPIC_CALIBRATE, 2).await;
+                println!("MQTT connected + subscribed");
+                return true;
+            }
+            println!("MQTT protocol handshake failed");
+        }
+        Err(e) => {
+            println!("TCP connect failed: {:?}", e);
+        }
+    }
+    false
+}
+
+async fn reconnect_loop<'a, I2C>(
+    wifi: &mut esp_radio::wifi::WifiController<'a>,
+    socket: &mut TcpSocket<'a>,
+    stack: embassy_net::Stack<'a>,
+    oled: &mut OledScreen<I2C>,
+) -> bool
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    println!("Attempting MQTT reconnect...");
+
+    loop {
+        // If the network link or IP config is down, re-establish WiFi+DHCP.
+        if !stack.is_link_up() || !stack.is_config_up() {
+            println!("Network down (link={}, config={}), reconnecting WiFi...",
+                stack.is_link_up(), stack.is_config_up());
+            oled.show_boot("WiFi...", "Reconnect");
+
+            let _ = wifi.disconnect_async().await;
+            Timer::after_millis(500).await;
+            match wifi.connect_async().await {
+                Ok(()) => println!("WiFi reconnected"),
+                Err(e) => println!("WiFi reconnect failed: {:?}", e),
+            }
+
+            // Wait for DHCP to assign an IP again.
+            let link_future = stack.wait_link_up();
+            let timeout = Timer::after_millis(15000);
+            match select(link_future, timeout).await {
+                Either::First(_) => {}
+                Either::Second(_) => {
+                    println!("Timed out waiting for link up");
+                    Timer::after_millis(RECONNECT_DELAY_MS).await;
+                    continue;
+                }
+            }
+
+            let cfg_future = stack.wait_config_up();
+            let timeout = Timer::after_millis(15000);
+            match select(cfg_future, timeout).await {
+                Either::First(_) => println!("Network ready again (DHCP OK)"),
+                Either::Second(_) => {
+                    println!("Timed out waiting for DHCP");
+                    Timer::after_millis(RECONNECT_DELAY_MS).await;
+                    continue;
+                }
+            }
+            oled.show_boot("WiFi", "Connected");
+        }
+
+        // Recreate socket (old one may be in bad state)
+        *socket = new_socket(stack);
+
+        if try_mqtt_connect(socket).await {
+            println!("MQTT reconnected");
+            return true;
+        }
+
+        println!("Reconnect failed, retrying in {}s...", RECONNECT_DELAY_MS / 1000);
+        Timer::after_millis(RECONNECT_DELAY_MS).await;
+    }
+}
+
+fn format_number(val: u8, buf: &mut [u8]) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 3];
+    let mut i = 0;
+    let mut v = val;
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    let mut j = 0;
+    while i > 0 {
+        i -= 1;
+        buf[j] = tmp[i];
+        j += 1;
+    }
+    j
+}
+
+fn parse_calibration(json: &str) -> Option<(u16, u16)> {
+    let json = json.trim();
+    if !json.starts_with('{') || !json.ends_with('}') {
+        return None;
+    }
+    let inner = &json[1..json.len() - 1];
+
+    let mut dry: Option<u16> = None;
+    let mut wet: Option<u16> = None;
+
+    for part in inner.split(',') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("\"dry\"").or_else(|| part.strip_prefix("dry")) {
+            let val = val.trim().trim_start_matches(':').trim();
+            dry = val.parse().ok();
+        } else if let Some(val) =
+            part.strip_prefix("\"wet\"").or_else(|| part.strip_prefix("wet"))
+        {
+            let val = val.trim().trim_start_matches(':').trim();
+            wet = val.parse().ok();
+        }
+    }
+
+    Some((dry?, wet?))
 }
