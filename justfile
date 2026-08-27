@@ -44,7 +44,7 @@ run:
     docker exec -it {{ container }} cargo run
 
 monitor:
-    docker exec -it {{ container }} espflash monitor {{ port }}
+    espflash monitor {{ port }}
 
 shell:
     docker exec -it {{ container }} /bin/bash

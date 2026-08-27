@@ -246,7 +246,7 @@ async fn main(_spawner: Spawner) {
             Either::First(mqtt::MqttStatus::Disconnected) => {
                 // Socket read error — connection lost
                 println!("MQTT: connection lost");
-                mqtt_connected = reconnect_loop(&mut socket, stack).await;
+                mqtt_connected = reconnect_loop(&mut wifi, &mut socket, stack, &mut oled).await;
             }
             Either::First(mqtt::MqttStatus::NoData) => {
                 // No complete packet available, nothing to do
@@ -266,7 +266,7 @@ async fn main(_spawner: Spawner) {
                 .is_err()
             {
                 println!("MQTT: publish failed, reconnecting...");
-                mqtt_connected = reconnect_loop(&mut socket, stack).await;
+                mqtt_connected = reconnect_loop(&mut wifi, &mut socket, stack, &mut oled).await;
             }
         }
         publish_counter += 1;
@@ -331,14 +331,61 @@ async fn try_mqtt_connect(socket: &mut TcpSocket<'_>) -> bool {
     false
 }
 
-async fn reconnect_loop<'a>(socket: &mut TcpSocket<'a>, stack: embassy_net::Stack<'a>) -> bool {
+async fn reconnect_loop<'a, I2C>(
+    wifi: &mut esp_radio::wifi::WifiController<'a>,
+    socket: &mut TcpSocket<'a>,
+    stack: embassy_net::Stack<'a>,
+    oled: &mut OledScreen<I2C>,
+) -> bool
+where
+    I2C: embedded_hal::i2c::I2c,
+{
     println!("Attempting MQTT reconnect...");
 
     loop {
+        // If the network link or IP config is down, re-establish WiFi+DHCP.
+        if !stack.is_link_up() || !stack.is_config_up() {
+            println!("Network down (link={}, config={}), reconnecting WiFi...",
+                stack.is_link_up(), stack.is_config_up());
+            oled.show_boot("WiFi...", "Reconnect");
+
+            let _ = wifi.disconnect_async().await;
+            Timer::after_millis(500).await;
+            match wifi.connect_async().await {
+                Ok(()) => println!("WiFi reconnected"),
+                Err(e) => println!("WiFi reconnect failed: {:?}", e),
+            }
+
+            // Wait for DHCP to assign an IP again.
+            let link_future = stack.wait_link_up();
+            let timeout = Timer::after_millis(15000);
+            match select(link_future, timeout).await {
+                Either::First(_) => {}
+                Either::Second(_) => {
+                    println!("Timed out waiting for link up");
+                    Timer::after_millis(RECONNECT_DELAY_MS).await;
+                    continue;
+                }
+            }
+
+            let cfg_future = stack.wait_config_up();
+            let timeout = Timer::after_millis(15000);
+            match select(cfg_future, timeout).await {
+                Either::First(_) => println!("Network ready again (DHCP OK)"),
+                Either::Second(_) => {
+                    println!("Timed out waiting for DHCP");
+                    Timer::after_millis(RECONNECT_DELAY_MS).await;
+                    continue;
+                }
+            }
+            oled.show_boot("WiFi", "Connected");
+        }
+
         // Recreate socket (old one may be in bad state)
         *socket = new_socket(stack);
 
         if try_mqtt_connect(socket).await {
+            println!("MQTT reconnected");
             return true;
         }
 
