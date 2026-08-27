@@ -6,6 +6,37 @@ use embassy_time::Timer;
 const WRITE_TIMEOUT_MS: u64 = 1000;
 const READ_TIMEOUT_MS: u64 = 2000;
 
+/// Persistent receive state for MQTT. The buffer accumulates incoming bytes
+/// across `poll` calls so that partial or coalesced TCP segments are handled
+/// correctly. Only one complete MQTT packet is decoded per `poll` call; the
+/// remainder is kept for the next call.
+///
+/// The unread portion lives in `buf[start..end]`. Consuming a packet advances
+/// `start`; when the buffer would otherwise be exhausted we reset both
+/// indices. No bytes are physically moved while an event derived from the
+/// buffer is still alive, so returned `MqttEvent`s may borrow the buffer.
+pub struct MqttRx<'a> {
+    buf: &'a mut [u8],
+    start: usize,
+    end: usize,
+}
+
+impl<'a> MqttRx<'a> {
+    /// Creates a new receive state backed by the given buffer.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Returns how many bytes are currently buffered (unconsumed).
+    pub fn pending(&self) -> usize {
+        self.end - self.start
+    }
+}
+
 #[derive(Debug)]
 pub enum MqttError {
     ConnectionFailed,
@@ -14,15 +45,44 @@ pub enum MqttError {
     Timeout,
 }
 
-#[derive(Debug, Clone)]
-pub enum MqttEvent<'a> {
+/// A fully-decoded MQTT event, with owned copies of topic and payload so it
+/// does not borrow from the receive buffer. Sized for this application's
+/// topics and payloads.
+pub enum MqttEvent {
     Publish {
-        topic: &'a str,
-        payload: &'a [u8],
+        topic: ArrayBuf<64>,
+        payload: ArrayBuf<256>,
     },
     PingResp,
     SubAck,
     ConnAck,
+}
+
+/// A fixed-capacity owned byte buffer with a length.
+pub struct ArrayBuf<const N: usize> {
+    data: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> ArrayBuf<N> {
+    fn new() -> Self {
+        Self { data: [0u8; N], len: 0 }
+    }
+
+    /// Copies `src` into the buffer (truncating if it doesn't fit).
+    fn copy_from(&mut self, src: &[u8]) {
+        let n = src.len().min(N);
+        self.data[..n].copy_from_slice(&src[..n]);
+        self.len = n;
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(self.as_slice()).ok()
+    }
 }
 
 fn encode_variable_length(mut len: usize, buf: &mut [u8]) -> usize {
@@ -248,42 +308,125 @@ pub async fn ping(socket: &mut TcpSocket<'_>) -> Result<(), MqttError> {
     }
 }
 
-pub async fn poll<'a>(
-    socket: &mut TcpSocket<'_>,
-    rx_buf: &'a mut [u8],
-) -> Option<MqttEvent<'a>> {
-    let n = match socket.read(rx_buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return None,
+/// Parses one MQTT packet from the front of `data` (the full buffered bytes).
+/// Returns `(event, consumed)` where `consumed` is the number of bytes the
+/// packet occupies, or `None` if the data is incomplete (need more bytes) or
+/// the packet type is unknown.
+fn decode_packet(data: &[u8]) -> Option<(MqttEvent, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let first = data[0];
+    let packet_type = (first >> 4) & 0x0F;
+
+    // Decode the "remaining length" varint to know the full packet size.
+    let (remaining_len, var_len_bytes) = match decode_variable_length(&data[1..]) {
+        Ok(v) => v,
+        Err(_) => return None,
     };
 
-    let data = &rx_buf[..n];
-    let packet_type = (data[0] >> 4) & 0x0F;
+    let total = 1 + var_len_bytes + remaining_len;
+    if data.len() < total {
+        // Incomplete packet — need more bytes before we can parse it.
+        return None;
+    }
+
+    // Body starts after fixed header (1 type byte + remaining-length varint).
+    let body_start = 1 + var_len_bytes;
+    let body = &data[body_start..total];
 
     match packet_type {
         0x03 => {
             // PUBLISH
-            if data.len() < 4 {
+            if body.len() < 2 {
                 return None;
             }
-            let (_remaining_len, var_len_bytes) = decode_variable_length(&data[1..]).ok()?;
-            let var_start = 1 + var_len_bytes;
-            if data.len() < var_start + 2 {
-                return None;
-            }
-            let topic_len = ((data[var_start] as usize) << 8) | (data[var_start + 1] as usize);
-            let topic_start = var_start + 2;
+            let topic_len = ((body[0] as usize) << 8) | (body[1] as usize);
+            let topic_start = 2;
             let topic_end = topic_start + topic_len;
-            if topic_end > data.len() {
+            if topic_end > body.len() {
                 return None;
             }
-            let topic = core::str::from_utf8(&data[topic_start..topic_end]).ok()?;
-            let payload = &data[topic_end..];
-            Some(MqttEvent::Publish { topic, payload })
+            let mut topic = ArrayBuf::new();
+            topic.copy_from(&body[topic_start..topic_end]);
+            let mut payload = ArrayBuf::new();
+            payload.copy_from(&body[topic_end..]);
+            Some((MqttEvent::Publish { topic, payload }, total))
         }
-        0x0D => Some(MqttEvent::PingResp),
-        0x90 => Some(MqttEvent::SubAck),
-        0x20 => Some(MqttEvent::ConnAck),
+        0x0D => Some((MqttEvent::PingResp, total)),
+        0x90 => Some((MqttEvent::SubAck, total)),
+        0x20 => Some((MqttEvent::ConnAck, total)),
         _ => None,
+    }
+}
+
+/// Reads any available MQTT data from the socket into the persistent receive
+/// state and decodes one complete packet if possible.
+///
+/// Returns `MqttStatus::Event` when a full packet was decoded (consuming it),
+/// `MqttStatus::NoData` when nothing was read or no complete packet is
+/// available yet, and `MqttStatus::Disconnected` only when the socket is
+/// actually broken (read error) so the caller knows to reconnect.
+pub enum MqttStatus {
+    Event(MqttEvent),
+    NoData,
+    Disconnected,
+}
+
+pub async fn poll(socket: &mut TcpSocket<'_>, rx: &mut MqttRx<'_>) -> MqttStatus {
+    // First, try to decode a packet from any leftover buffered data.
+    let decoded = {
+        let data = &rx.buf[rx.start..rx.end];
+        decode_packet(data)
+    };
+    if let Some((event, consumed)) = decoded {
+        advance(rx, consumed);
+        return MqttStatus::Event(event);
+    }
+
+    // No complete packet yet — if the buffer is full we're out of sync;
+    // drop everything and start fresh.
+    if rx.end == rx.buf.len() {
+        rx.start = 0;
+        rx.end = 0;
+    }
+
+    // Read more data into the free space at the end of the buffer.
+    // `available` is disjoint from `buf[start..end]` because we only read
+    // into `buf[end..]` and nothing above references the consumed region.
+    let n = {
+        let available = &mut rx.buf[rx.end..];
+        if available.is_empty() {
+            return MqttStatus::NoData;
+        }
+        match socket.read(available).await {
+            Ok(n) if n > 0 => n,
+            Ok(_) => return MqttStatus::NoData,
+            Err(_) => return MqttStatus::Disconnected,
+        }
+    };
+    rx.end += n;
+
+    // Try to decode a packet from the data available so far.
+    let decoded = {
+        let data = &rx.buf[rx.start..rx.end];
+        decode_packet(data)
+    };
+    if let Some((event, consumed)) = decoded {
+        advance(rx, consumed);
+        MqttStatus::Event(event)
+    } else {
+        MqttStatus::NoData
+    }
+}
+
+/// Advances the read pointer past `consumed` bytes. Only adjusts indices,
+/// never moves bytes, so buffers referenced by a live `MqttEvent` stay valid.
+fn advance(rx: &mut MqttRx<'_>, consumed: usize) {
+    rx.start += consumed;
+    if rx.start == rx.end {
+        rx.start = 0;
+        rx.end = 0;
     }
 }

@@ -47,6 +47,7 @@ const TCP_CONNECT_TIMEOUT_MS: u64 = 5000;
 static mut STACK_RESOURCES: embassy_net::StackResources<5> = embassy_net::StackResources::new();
 static mut TCP_RX_BUF: [u8; 1024] = [0u8; 1024];
 static mut TCP_TX_BUF: [u8; 1024] = [0u8; 1024];
+static mut MQTT_RX_BUF: [u8; 512] = [0u8; 512];
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -60,6 +61,8 @@ async fn main(_spawner: Spawner) {
     esp_rtos::start(timg0.timer0);
 
     println!("Planty starting...");
+    println!("W_SSID {}", WIFI_SSID);
+    println!("W_PWS: {}", WIFI_PASSWORD);
 
     // --- Peripherals ---
     let mut adc1_config = AdcConfig::new();
@@ -101,7 +104,9 @@ async fn main(_spawner: Spawner) {
     let mut valve = Servo360::new(channel, 250);
     let mut last_state = State::Wet;
     let mut delay = esp_hal::delay::Delay::new();
-    let mut cal_buf = [0u8; 256];
+    let mut mqtt_rx = mqtt::MqttRx::new(unsafe {
+        &mut *core::ptr::addr_of_mut!(MQTT_RX_BUF)
+    });
 
     // --- WiFi ---
     println!("4. Initializing WiFi...");
@@ -196,31 +201,32 @@ async fn main(_spawner: Spawner) {
         }
 
         // 3. Poll MQTT for commands (with timeout — non-blocking)
-        let poll_fut = mqtt::poll(&mut socket, &mut cal_buf);
+        let poll_fut = mqtt::poll(&mut socket, &mut mqtt_rx);
         let timeout_fut = Timer::after_millis(POLL_TIMEOUT_MS);
 
         match select(poll_fut, timeout_fut).await {
-            Either::First(Some(event)) => {
+            Either::First(mqtt::MqttStatus::Event(event)) => {
                 match event {
                     mqtt::MqttEvent::Publish { topic, payload } => {
-                        if topic == TOPIC_MOTOR {
-                            match core::str::from_utf8(payload) {
-                                Ok("open") => {
+                        let topic_str = topic.as_str();
+                        if topic_str == Some(TOPIC_MOTOR) {
+                            match payload.as_str() {
+                                Some("open") => {
                                     println!("MQTT: Opening valve...");
                                     valve.open(&mut delay);
                                     delay.delay_millis(1500);
                                 }
-                                Ok("close") => {
+                                Some("close") => {
                                     println!("MQTT: Closing valve...");
                                     valve.close(&mut delay);
                                     delay.delay_millis(1500);
                                 }
-                                Ok(other) => println!("MQTT: unknown motor cmd: {}", other),
-                                Err(_) => println!("MQTT: motor cmd not valid utf8"),
+                                Some(other) => println!("MQTT: unknown motor cmd: {}", other),
+                                None => println!("MQTT: motor cmd not valid utf8"),
                             }
-                        } else if topic == TOPIC_CALIBRATE {
-                            match core::str::from_utf8(payload) {
-                                Ok(json) => {
+                        } else if topic_str == Some(TOPIC_CALIBRATE) {
+                            match payload.as_str() {
+                                Some(json) => {
                                     if let Some((dry, wet)) = parse_calibration(json) {
                                         println!("MQTT: Calibrating dry={} wet={}", dry, wet);
                                         sensor.calibrate(dry, wet);
@@ -228,7 +234,7 @@ async fn main(_spawner: Spawner) {
                                         println!("MQTT: failed to parse calibration json");
                                     }
                                 }
-                                Err(_) => println!("MQTT: calibrate not valid utf8"),
+                                None => println!("MQTT: calibrate not valid utf8"),
                             }
                         }
                     }
@@ -237,10 +243,13 @@ async fn main(_spawner: Spawner) {
                     mqtt::MqttEvent::ConnAck => {}
                 }
             }
-            Either::First(None) => {
-                // poll returned None — socket read error, connection lost
+            Either::First(mqtt::MqttStatus::Disconnected) => {
+                // Socket read error — connection lost
                 println!("MQTT: connection lost");
                 mqtt_connected = reconnect_loop(&mut socket, stack).await;
+            }
+            Either::First(mqtt::MqttStatus::NoData) => {
+                // No complete packet available, nothing to do
             }
             Either::Second(_) => {
                 // Timeout — no MQTT data, that's fine
