@@ -1,7 +1,7 @@
 use embedded_hal::delay::DelayNs;
 use esp_hal::{
     ledc::{
-        channel::{Channel, ChannelIFace},
+        channel::{Channel, ChannelHW, ChannelIFace},
         timer::TimerSpeed,
     },
     peripherals::FLASH,
@@ -61,6 +61,9 @@ impl<'a, S: TimerSpeed> Servo for Servo360<'a, S> {
     }
 }
 
+const ANGLE_CLOSE: u8 = 90;
+const ANGLE_OPEN: u8 = 0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ServoState {
     Open,
@@ -70,8 +73,8 @@ pub enum ServoState {
 pub struct Servo180<'a, S: TimerSpeed> {
     channel: Channel<'a, S>,
     travel_time_ms: u32,
-    duty_0_deg: u8,
-    duty_180_deg: u8,
+    duty_0_deg: u32,
+    duty_180_deg: u32,
     state: ServoState,
     storage: ValveStorage<'a>,
 }
@@ -80,38 +83,36 @@ impl<'a, S: TimerSpeed> Servo180<'a, S> {
     pub fn new(channel: Channel<'a, S>, travel_time_ms: u32, flash: FLASH<'a>) -> Self {
         let mut storage = ValveStorage::new(flash);
         let state = storage.load();
-        let mut servo = Self {
+        let servo = Self {
             channel,
             travel_time_ms,
-            duty_0_deg: 5,
-            duty_180_deg: 10,
+            duty_0_deg: 819,
+            duty_180_deg: 1638,
             state,
             storage,
         };
-        servo.set_angle(match state {
-            ServoState::Open => 180,
-            ServoState::Close => 0,
-        });
+        
         servo
     }
 
     pub fn set_angle(&mut self, angle_deg: u8) {
-        let angle = angle_deg.min(180);
-        let range = self.duty_180_deg.saturating_sub(self.duty_0_deg) as u32;
-        let duty = self.duty_0_deg as u32 + (range * angle as u32) / 180;
+        let angle = angle_deg.min(180) as u32;
+        let range = self.duty_180_deg.saturating_sub(self.duty_0_deg);
+        
+        let duty = self.duty_0_deg + (range * angle) / 180;
 
-        let _ = self.channel.set_duty(duty as u8);
+        let _ = self.channel.set_duty_hw(duty);
     }
 
     pub fn disable(&mut self) {
-        let _ = self.channel.set_duty(0);
+        let _ = self.channel.set_duty_hw(0);
     }
 }
 
 impl <'a, S: TimerSpeed> Servo for Servo180<'a, S> {
     fn open<D: DelayNs>(&mut self, delay: &mut D) {
         if self.state == ServoState::Close {
-            self.set_angle(90);
+            self.set_angle(ANGLE_OPEN);
             self.state = ServoState::Open;
             self.storage.save(ServoState::Open);
             delay.delay_ms(self.travel_time_ms);
@@ -120,7 +121,7 @@ impl <'a, S: TimerSpeed> Servo for Servo180<'a, S> {
 
     fn close<D: DelayNs>(&mut self, delay: &mut D) {
         if self.state == ServoState::Open {
-            self.set_angle(0);
+            self.set_angle(ANGLE_CLOSE);
             self.state = ServoState::Close;
             self.storage.save(ServoState::Close);
             delay.delay_ms(self.travel_time_ms);
