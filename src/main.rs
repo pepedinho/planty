@@ -90,7 +90,7 @@ async fn main(_spawner: Spawner) {
         })
         .unwrap();
 
-    let mut valve = Servo180::new(channel, 250);
+    let mut valve = Servo180::new(channel, 250, peripherals.FLASH);
     let mut last_state = State::Wet;
     let mut delay = esp_hal::delay::Delay::new();
     let mut mqtt_rx = mqtt::MqttRx::new(unsafe {

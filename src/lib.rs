@@ -2,5 +2,6 @@
 extern crate alloc;
 pub mod soil;
 pub mod servo;
+pub mod storage;
 pub mod wifi;
 pub mod mqtt;
