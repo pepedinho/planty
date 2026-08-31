@@ -41,6 +41,10 @@ const TOPIC_SOIL: &str = "planty/sensor/soil";
 const POLL_TIMEOUT_MS: u64 = 200;
 const RECONNECT_DELAY_MS: u64 = 5000;
 const TCP_CONNECT_TIMEOUT_MS: u64 = 5000;
+/// Number of consecutive MQTT polls that yielded no event before we consider
+/// the link silently dead and force a reconnect. The loop iterates ~1/s, so
+/// this is roughly the number of seconds of silence tolerated.
+const MQTT_STALL_THRESHOLD: u32 = 45;
 
 static mut STACK_RESOURCES: embassy_net::StackResources<5> = embassy_net::StackResources::new();
 static mut TCP_RX_BUF: [u8; 1024] = [0u8; 1024];
@@ -154,6 +158,7 @@ async fn main(_spawner: Spawner) {
     println!("8. MQTT ready");
 
     let mut publish_counter: u32 = 0;
+    let mut silent_polls: u32 = 0;
 
     // --- Main loop ---
     loop {
@@ -185,6 +190,7 @@ async fn main(_spawner: Spawner) {
 
         match select(poll_fut, timeout_fut).await {
             Either::First(mqtt::MqttStatus::Event(event)) => {
+                silent_polls = 0;
                 match event {
                     mqtt::MqttEvent::Publish { topic, payload } => {
                         let topic_str = topic.as_str();
@@ -221,15 +227,31 @@ async fn main(_spawner: Spawner) {
                 }
             }
             Either::First(mqtt::MqttStatus::Disconnected) => {
-                // Socket read error — connection lost
+                silent_polls = 0;
+                // Socket read error or EOF (remote closed) — connection lost.
+                // Previously a closed socket surfaced as a benign "no data" and
+                // the loop kept running forever with no clear message; now we
+                // detect it and reconnect promptly.
                 println!("MQTT: connection lost");
-                let _ = reconnect_loop(&mut wifi, &mut socket, stack).await;
+                let _ = reconnect_loop(&mut wifi, &mut socket, stack, &mut mqtt_rx).await;
             }
             Either::First(mqtt::MqttStatus::NoData) => {
-                // No complete packet available, nothing to do
+                // No complete packet available, nothing to do.
+                silent_polls += 1;
+                if silent_polls >= MQTT_STALL_THRESHOLD {
+                    println!("MQTT: RX stalled ({} silent polls), forcing reconnect", silent_polls);
+                    silent_polls = 0;
+                    let _ = reconnect_loop(&mut wifi, &mut socket, stack, &mut mqtt_rx).await;
+                }
             }
             Either::Second(_) => {
-                // Timeout — no MQTT data, that's fine
+                // Timeout — no MQTT data, that's fine.
+                silent_polls += 1;
+                if silent_polls >= MQTT_STALL_THRESHOLD {
+                    println!("MQTT: RX stalled ({} silent polls), forcing reconnect", silent_polls);
+                    silent_polls = 0;
+                    let _ = reconnect_loop(&mut wifi, &mut socket, stack, &mut mqtt_rx).await;
+                }
             }
         }
 
@@ -243,7 +265,7 @@ async fn main(_spawner: Spawner) {
                 .is_err()
             {
                 println!("MQTT: publish failed, reconnecting...");
-                let _ = reconnect_loop(&mut wifi, &mut socket, stack).await;
+                let _ = reconnect_loop(&mut wifi, &mut socket, stack, &mut mqtt_rx).await;
             }
         }
         publish_counter += 1;
@@ -311,6 +333,7 @@ async fn reconnect_loop<'a>(
     wifi: &mut esp_radio::wifi::WifiController<'a>,
     socket: &mut TcpSocket<'a>,
     stack: embassy_net::Stack<'a>,
+    mqtt_rx: &mut mqtt::MqttRx<'_>,
 ) -> bool {
     println!("Attempting MQTT reconnect...");
 
@@ -353,6 +376,9 @@ async fn reconnect_loop<'a>(
 
         // Recreate socket (old one may be in bad state)
         *socket = new_socket(stack);
+        // Drop any stale partial MQTT bytes buffered from the dead connection
+        // so they can't desync the freshly (re)subscribed connection.
+        mqtt_rx.clear();
 
         if try_mqtt_connect(socket).await {
             println!("MQTT reconnected");

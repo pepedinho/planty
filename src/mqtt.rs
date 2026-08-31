@@ -35,6 +35,14 @@ impl<'a> MqttRx<'a> {
     pub fn pending(&self) -> usize {
         self.end - self.start
     }
+
+    /// Drops any buffered data and resets to an empty state. Called when the
+    /// underlying socket is (re)created so stale bytes from a dead connection
+    /// never desync the fresh one.
+    pub fn clear(&mut self) {
+        self.start = 0;
+        self.end = 0;
+    }
 }
 
 #[derive(Debug)]
@@ -395,6 +403,11 @@ pub async fn poll(socket: &mut TcpSocket<'_>, rx: &mut MqttRx<'_>) -> MqttStatus
     // Read more data into the free space at the end of the buffer.
     // `available` is disjoint from `buf[start..end]` because we only read
     // into `buf[end..]` and nothing above references the consumed region.
+    //
+    // CAUTION: for embassy-net, `read` returning `Ok(0)` means the remote
+    // closed the connection (EOF) — NOT "no data available". We must treat it
+    // as a disconnection so the caller can reconnect promptly instead of
+    // silently stalling with no clear message.
     let n = {
         let available = &mut rx.buf[rx.end..];
         if available.is_empty() {
@@ -402,7 +415,7 @@ pub async fn poll(socket: &mut TcpSocket<'_>, rx: &mut MqttRx<'_>) -> MqttStatus
         }
         match socket.read(available).await {
             Ok(n) if n > 0 => n,
-            Ok(_) => return MqttStatus::NoData,
+            Ok(_) => return MqttStatus::Disconnected,
             Err(_) => return MqttStatus::Disconnected,
         }
     };
