@@ -107,6 +107,11 @@ impl<'a, S: TimerSpeed> Servo180<'a, S> {
     pub fn disable(&mut self) {
         let _ = self.channel.set_duty_hw(0);
     }
+
+    /// Returns the current logical state of the valve.
+    pub fn state(&self) -> ServoState {
+        self.state
+    }
 }
 
 impl <'a, S: TimerSpeed> Servo for Servo180<'a, S> {

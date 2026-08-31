@@ -12,7 +12,7 @@ use embassy_time::Timer;
 use esp_backtrace as _;
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, Attenuation},
-    gpio::DriveMode,
+    gpio::{DriveMode, Input, InputConfig, Pull},
     ledc::{
         LSGlobalClkSource, Ledc, LowSpeed,
         channel::{self, ChannelIFace},
@@ -24,7 +24,7 @@ use esp_hal::{
 use esp_println::println;
 use planty::{
     mqtt,
-    servo::{Servo, Servo180},
+    servo::{Servo, Servo180, ServoState},
     soil::{SoilSensor, State},
 };
 
@@ -100,6 +100,15 @@ async fn main(_spawner: Spawner) {
     let mut mqtt_rx = mqtt::MqttRx::new(unsafe {
         &mut *core::ptr::addr_of_mut!(MQTT_RX_BUF)
     });
+
+    // --- Button (GPIO19, pull-up, connects to GND when pressed) ---
+    let button = Input::new(
+        peripherals.GPIO19,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    // Edge detection: only toggle once per press, not continuously while held.
+    let mut button_prev_pressed = false;
+    println!("2. Button OK (GPIO19)");
 
     // --- WiFi ---
     println!("4. Initializing WiFi...");
@@ -183,6 +192,24 @@ async fn main(_spawner: Spawner) {
             }
             last_state = current_state;
         }
+
+        // 2.5 Button toggle (falling edge: pull-up -> GND when pressed)
+        let button_pressed = button.is_low();
+        if button_pressed && !button_prev_pressed {
+            match valve.state() {
+                ServoState::Close => {
+                    println!("BTN: Opening valve...");
+                    valve.open(&mut delay);
+                    let _ = mqtt::publish(&mut socket, TOPIC_MOTOR, b"open").await;
+                }
+                ServoState::Open => {
+                    println!("BTN: Closing valve...");
+                    valve.close(&mut delay);
+                    let _ = mqtt::publish(&mut socket, TOPIC_MOTOR, b"close").await;
+                }
+            }
+        }
+        button_prev_pressed = button_pressed;
 
         // 3. Poll MQTT for commands (with timeout — non-blocking)
         let poll_fut = mqtt::poll(&mut socket, &mut mqtt_rx);
