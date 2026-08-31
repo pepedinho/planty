@@ -166,6 +166,7 @@ async fn main(_spawner: Spawner) {
         let humidity = sensor.read_percentage();
         oled.show_metrics(raw, humidity, true, false);
         println!("MQTT failed, retrying in {}s...", RECONNECT_DELAY_MS / 1000);
+        oled.show_boot("MQTT", "Failed retry");
         Timer::after_millis(RECONNECT_DELAY_MS).await;
     }
 
