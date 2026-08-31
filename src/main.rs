@@ -13,7 +13,6 @@ use esp_backtrace as _;
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, Attenuation},
     gpio::DriveMode,
-    i2c::master::{Config as I2cConfig, I2c},
     ledc::{
         LSGlobalClkSource, Ledc, LowSpeed,
         channel::{self, ChannelIFace},
@@ -24,9 +23,8 @@ use esp_hal::{
 };
 use esp_println::println;
 use planty::{
-    display::OledScreen,
     mqtt,
-    servo::{Servo, Servo360},
+    servo::{Servo, Servo180},
     soil::{SoilSensor, State},
 };
 
@@ -72,15 +70,6 @@ async fn main(_spawner: Spawner) {
     sensor.calibrate(3263, 1610);
     println!("1. Soil Sensor OK (GPIO34 / ADC1)");
 
-    let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
-        .unwrap()
-        .with_sda(peripherals.GPIO21)
-        .with_scl(peripherals.GPIO22);
-    println!("2. I2C OK");
-    let mut oled = OledScreen::new(i2c).expect("Failing to init OLED");
-    oled.show_boot("Init...", "OLED OK");
-    println!("3. OLED screen OK");
-
     let mut ledc = Ledc::new(peripherals.LEDC);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
@@ -101,7 +90,7 @@ async fn main(_spawner: Spawner) {
         })
         .unwrap();
 
-    let mut valve = Servo360::new(channel, 250);
+    let mut valve = Servo180::new(channel, 250);
     let mut last_state = State::Wet;
     let mut delay = esp_hal::delay::Delay::new();
     let mut mqtt_rx = mqtt::MqttRx::new(unsafe {
@@ -110,7 +99,6 @@ async fn main(_spawner: Spawner) {
 
     // --- WiFi ---
     println!("4. Initializing WiFi...");
-    oled.show_boot("WiFi...", "Connecting");
     let radio_controller = esp_radio::init().expect("Failed to init radio");
     let radio_static: &'static esp_radio::Controller<'static> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(radio_controller));
@@ -129,7 +117,6 @@ async fn main(_spawner: Spawner) {
         .await
         .expect("Failed to connect WiFi");
     println!("5. WiFi connected");
-    oled.show_boot("WiFi", "Connected");
 
     // --- Embassy-net ---
     let random_seed = esp_hal::rng::Rng::new().random() as u64;
@@ -148,13 +135,11 @@ async fn main(_spawner: Spawner) {
 
     stack.wait_config_up().await;
     println!("6. Network ready (DHCP OK)");
-    oled.show_boot("Network", "DHCP OK");
 
     // --- MQTT connect with retry ---
     let mut socket = new_socket(stack);
 
     println!("7. Connecting MQTT...");
-    oled.show_boot("MQTT...", "Connecting");
 
     let mut mqtt_connected;
     loop {
@@ -162,16 +147,11 @@ async fn main(_spawner: Spawner) {
         if mqtt_connected {
             break;
         }
-        let raw = sensor.read_raw();
-        let humidity = sensor.read_percentage();
-        oled.show_metrics(raw, humidity, true, false);
         println!("MQTT failed, retrying in {}s...", RECONNECT_DELAY_MS / 1000);
-        oled.show_boot("MQTT", "Failed retry");
         Timer::after_millis(RECONNECT_DELAY_MS).await;
     }
 
     println!("8. MQTT ready");
-    oled.show_boot("MQTT", "Connected");
 
     let mut publish_counter: u32 = 0;
 
@@ -188,13 +168,11 @@ async fn main(_spawner: Spawner) {
                 State::Dry => {
                     println!("DRY: Opening Valve...");
                     valve.open(&mut delay);
-                    delay.delay_millis(1500);
                     let _ = mqtt::publish(&mut socket, TOPIC_MOTOR, b"open").await;
                 }
                 State::Wet => {
                     println!("Wet: Closing Valve...");
                     valve.close(&mut delay);
-                    delay.delay_millis(1500);
                     let _ = mqtt::publish(&mut socket, TOPIC_MOTOR, b"close").await;
                 }
             }
@@ -215,12 +193,10 @@ async fn main(_spawner: Spawner) {
                                 Some("open") => {
                                     println!("MQTT: Opening valve...");
                                     valve.open(&mut delay);
-                                    delay.delay_millis(1500);
                                 }
                                 Some("close") => {
                                     println!("MQTT: Closing valve...");
                                     valve.close(&mut delay);
-                                    delay.delay_millis(1500);
                                 }
                                 Some(other) => println!("MQTT: unknown motor cmd: {}", other),
                                 None => println!("MQTT: motor cmd not valid utf8"),
@@ -247,7 +223,7 @@ async fn main(_spawner: Spawner) {
             Either::First(mqtt::MqttStatus::Disconnected) => {
                 // Socket read error — connection lost
                 println!("MQTT: connection lost");
-                mqtt_connected = reconnect_loop(&mut wifi, &mut socket, stack, &mut oled).await;
+                let _ = reconnect_loop(&mut wifi, &mut socket, stack).await;
             }
             Either::First(mqtt::MqttStatus::NoData) => {
                 // No complete packet available, nothing to do
@@ -267,13 +243,12 @@ async fn main(_spawner: Spawner) {
                 .is_err()
             {
                 println!("MQTT: publish failed, reconnecting...");
-                mqtt_connected = reconnect_loop(&mut wifi, &mut socket, stack, &mut oled).await;
+                let _ = reconnect_loop(&mut wifi, &mut socket, stack).await;
             }
         }
         publish_counter += 1;
 
-        // 5. Update display
-        oled.show_metrics(raw, humidity, true, mqtt_connected);
+        // 5. Log sensor metrics
         println!("Raw: {} | Humidity: {}%", raw, humidity);
 
         // 6. Wait
@@ -332,15 +307,11 @@ async fn try_mqtt_connect(socket: &mut TcpSocket<'_>) -> bool {
     false
 }
 
-async fn reconnect_loop<'a, I2C>(
+async fn reconnect_loop<'a>(
     wifi: &mut esp_radio::wifi::WifiController<'a>,
     socket: &mut TcpSocket<'a>,
     stack: embassy_net::Stack<'a>,
-    oled: &mut OledScreen<I2C>,
-) -> bool
-where
-    I2C: embedded_hal::i2c::I2c,
-{
+) -> bool {
     println!("Attempting MQTT reconnect...");
 
     loop {
@@ -348,7 +319,6 @@ where
         if !stack.is_link_up() || !stack.is_config_up() {
             println!("Network down (link={}, config={}), reconnecting WiFi...",
                 stack.is_link_up(), stack.is_config_up());
-            oled.show_boot("WiFi...", "Reconnect");
 
             let _ = wifi.disconnect_async().await;
             Timer::after_millis(500).await;
@@ -379,7 +349,6 @@ where
                     continue;
                 }
             }
-            oled.show_boot("WiFi", "Connected");
         }
 
         // Recreate socket (old one may be in bad state)

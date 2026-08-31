@@ -1,5 +1,8 @@
 use embedded_hal::delay::DelayNs;
-use esp_hal::ledc::{channel::{self, Channel, ChannelIFace}, timer::TimerSpeed};
+use esp_hal::ledc::{
+    channel::{Channel, ChannelIFace},
+    timer::TimerSpeed,
+};
 
 
 
